@@ -123,7 +123,6 @@ button.primary:hover:not(:disabled) { background: #1b8ae0; }
 .sw { width: 18px; height: 12px; border-radius: 3px; flex: none; }
 .sw.warm { background: #d9542b; }
 .sw.line { background: #1c9a9a; border-top: 2px solid #ebf5ff; }
-.sw.shear { background: repeating-linear-gradient(45deg, #b05cff 0 2px, #1f6f9f 2px 6px); }
 .sw.land { background: linear-gradient(90deg, #5b8c4a, #8a7a5c, #b0a084); }
 
 .log { margin: 0; padding-left: 18px; max-height: 170px; overflow-y: auto; font-size: 13px; display: grid; gap: 3px; }
@@ -187,7 +186,20 @@ button.primary:hover:not(:disabled) { background: #1b8ae0; }
 .rank li b { color: #1a1a1a; padding: 1px 7px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
 .rank li.empty { color: var(--muted); }
 
-.sw.wake { background: #bfe6ff; }
+.sw.wake { background: #1c9a9a; }
+.sw.cloud { background: radial-gradient(circle at 30% 40%, #fff 0 30%, transparent 32%), radial-gradient(circle at 70% 60%, #eee 0 28%, #0b1e3e 30%); }
+.sw.cirrus { background: repeating-linear-gradient(170deg, rgba(255,255,255,.85) 0 2px, #0b1e3e 2px 5px); }
+.sw.front { background: linear-gradient(180deg, #0b1e3e 0 30%, #e8e8e8 30% 70%, #0b1e3e 70%); }
+.shear-scale { height: 10px; border-radius: 5px; background: linear-gradient(90deg, #102248, #3e3e96 25%, #8c46c8 50%, #e173eb 80%, #ffc8ff); }
+
+.views { position: absolute; top: 10px; left: 10px; z-index: 2; display: flex; gap: 4px; }
+.views button { padding: 5px 10px; font-size: 13px; background: rgba(5,12,24,.75); }
+.views button.on { background: #1679c4; border-color: #1f8fe0; font-weight: 700; }
+
+.forecast { display: flex; gap: 8px; align-items: center; }
+.forecast button { padding: 4px 10px; }
+.forecast input { flex: 1; accent-color: #ffd66b; }
+.hint { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .dmg-scale { display: flex; border-radius: 6px; overflow: hidden; font-size: 11px; font-weight: 700; color: #1a1a1a; }
 .dmg-scale span { flex: 1; text-align: center; padding: 3px 0; }
 

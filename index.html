@@ -14,6 +14,11 @@
 
   <main>
     <section class="stage">
+      <div class="views">
+        <button data-view="sat" class="on">🛰️ 衛星雲圖</button>
+        <button data-view="sst">🌡️ 海溫</button>
+        <button data-view="shear">💨 風切</button>
+      </div>
       <canvas id="map" width="960" height="706"></canvas>
       <div id="toast" class="toast hidden"></div>
       <div id="result" class="modal hidden">
@@ -63,6 +68,15 @@
       </div>
 
       <div class="block">
+        <div class="label">天氣預報 <b id="fcLabel" class="right">第 0.0 天</b></div>
+        <div class="forecast">
+          <button id="fcPlay" title="播放預報">▶</button>
+          <input id="fcDay" type="range" min="0" max="12" step="0.1" value="0">
+        </div>
+        <p class="hint">天氣系統會移動、生成與消散。畫路徑時地圖顯示颱風抵達該處那天的預報，但實際天氣會有誤差，越遠的日子越不準。</p>
+      </div>
+
+      <div class="block">
         <div class="label" id="envLabel">游標位置環境</div>
         <div class="env">
           <div><span>地區</span><b id="envPos">--</b></div>
@@ -90,15 +104,22 @@
       </div>
 
       <div class="block legend">
-        <div class="label">圖例</div>
-        <div class="sst-scale"></div>
-        <div class="sst-ticks"><span>22°C 冷</span><span>26.5°C</span><span>31°C 暖</span></div>
+        <div class="label">圖例（按 1／2／3 切換圖層）</div>
+        <div class="label">🛰️ 衛星雲圖</div>
         <ul>
-          <li><span class="sw warm"></span>海溫越高 → 增強上限越高</li>
-          <li><span class="sw line"></span>26.5°C 等溫線（以下會減弱）</li>
-          <li><span class="sw shear"></span>紫色斜線：垂直風切（撕裂颱風）</li>
-          <li><span class="sw wake"></span>冷水尾跡：颱風攪冷的海水</li>
+          <li><span class="sw cloud"></span>團塊狀對流雲：暖海上的旺盛對流</li>
+          <li><span class="sw cirrus"></span>拉長的卷雲：強風切區</li>
+          <li><span class="sw front"></span>北方帶狀雲：西風帶鋒面</li>
+        </ul>
+        <div class="label" style="margin-top:8px">🌡️ 海溫（越暖增強上限越高，白線為 26.5°C）</div>
+        <div class="sst-scale"></div>
+        <div class="sst-ticks"><span>22°C</span><span>26.5°C</span><span>31°C</span></div>
+        <div class="label" style="margin-top:8px">💨 風切（越強越會撕裂颱風，箭頭為移動方向）</div>
+        <div class="shear-scale"></div>
+        <div class="sst-ticks"><span>弱</span><span>中</span><span>強</span></div>
+        <ul>
           <li><span class="sw land"></span>陸地減弱，高山減弱更快</li>
+          <li><span class="sw wake"></span>颱風走過的海面會變冷（海溫圖可見）</li>
         </ul>
         <div class="label" style="margin-top:10px">災情等級</div>
         <div class="dmg-scale">

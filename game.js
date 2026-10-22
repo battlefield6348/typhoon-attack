@@ -14,6 +14,8 @@ const yToLat = y => {
   const m = merc(LAT1) - y / H * (merc(LAT1) - merc(LAT0));
   return (2 * Math.atan(Math.exp(m)) - Math.PI / 2) * 180 / Math.PI;
 };
+const CELL_LON = Float32Array.from({ length: GW }, (_, x) => xToLon((x + 0.5) * CELL));
+const CELL_LAT = Float32Array.from({ length: GH }, (_, y) => yToLat((y + 0.5) * CELL));
 
 // ===== 遊戲規則 =====
 const SPEED = 100;               // 颱風移動速度：100 px = 1 天（約時速 20 公里）
@@ -197,10 +199,10 @@ function rasterizeRegions(land) {
   return regionMap;
 }
 
-// 每個陸地格點到海岸的距離（格數）
-function coastDistance(land) {
+// fromLand=false：陸地格點到海岸的距離；true：海洋格點到陸地的距離（格數）
+function coastDistance(land, fromLand = false) {
   const dist = new Int32Array(GW * GH).fill(-1), queue = [];
-  for (let i = 0; i < land.length; i++) if (!land[i]) { dist[i] = 0; queue.push(i); }
+  for (let i = 0; i < land.length; i++) if (!land[i] !== fromLand) { dist[i] = 0; queue.push(i); }
   for (let q = 0; q < queue.length; q++) {
     const i = queue[q], x = i % GW, y = (i - x) / GW;
     for (const [nx, ny] of [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]]) {
@@ -235,39 +237,26 @@ function ridgeHeight(lon, lat) {
 // land: 陸地 / elev: 地形高度 0~1 / sst: 海溫 °C / shear: 垂直風切 0~1 / wake: 冷水尾跡降溫 °C
 function genWorld(seed) {
   const rand = mulberry32(seed);
-  const nS = makeNoise(rand), nW = makeNoise(rand), nE = makeNoise(rand);
+  const nS = makeNoise(rand), nE = makeNoise(rand);
   const n = GW * GH;
   const land = rasterizeLand();
   const dist = coastDistance(land);
-  const sst = new Float32Array(n), shear = new Float32Array(n), elev = new Float32Array(n);
-  const shearRaw = new Float32Array(n), oceanShear = [];
+  const sst = new Float32Array(n), elev = new Float32Array(n), relief = new Float32Array(n);
   const ox = rand() * 100, oy = rand() * 100;
 
   for (let y = 0; y < GH; y++) {
-    const lat = yToLat((y + 0.5) * CELL);
+    const lat = CELL_LAT[y];
     for (let x = 0; x < GW; x++) {
-      const i = y * GW + x, lon = xToLon((x + 0.5) * CELL);
+      const i = y * GW + x, lon = CELL_LON[x];
       if (land[i]) {
         const base = Math.min(dist[i] / 40, 1) * 0.45 * (0.6 + 0.8 * fbm(nE, x * 0.03, y * 0.03, 3));
-        elev[i] = clamp(Math.max(base, ridgeHeight(lon, lat)), 0, 1);
+        const rugged = 0.45 + 0.9 * fbm(nE, x * 0.07 + 50, y * 0.07, 4);   // 讓山脈有起伏，不是一整條
+        relief[i] = ridgeHeight(lon, lat) * rugged;
+        elev[i] = clamp(Math.max(base, relief[i]), 0, 1);
       } else {
-        // 每局隨機的海溫異常與高風切區，讓每次的天氣都不同
-        sst[i] = climateSst(lon, lat) + (fbm(nS, ox + x * 0.01, oy + y * 0.01, 3) - 0.5) * 2.4;
-        shearRaw[i] = fbm(nW, ox + x * 0.01, oy + y * 0.01, 3);
-        oceanShear.push(shearRaw[i]);
+        // 氣候值加上每局固定的小幅異常；會移動的暖、冷渦旋另外由天氣系統計算
+        sst[i] = climateSst(lon, lat) + (fbm(nS, ox + x * 0.01, oy + y * 0.01, 3) - 0.5) * 1.6;
       }
-    }
-  }
-
-  const sth = percentile(oceanShear, 0.8);
-  const smax = oceanShear.reduce((m, v) => Math.max(m, v), -Infinity);
-  for (let y = 0; y < GH; y++) {
-    const westerly = clamp((yToLat((y + 0.5) * CELL) - 28) / 10, 0, 1) * 0.4;   // 中緯度西風帶
-    for (let x = 0; x < GW; x++) {
-      const i = y * GW + x;
-      if (land[i]) continue;
-      const blob = clamp((shearRaw[i] - sth) / (smax - sth) * 1.3, 0, 1);
-      shear[i] = clamp(blob + westerly, 0, 1);
     }
   }
 
@@ -277,7 +266,8 @@ function genWorld(seed) {
   if (mode === 'mission') pickTargets(cities, rand);
   rasterizeRegions(land);
   return {
-    seed, land, elev, sst, shear, cities,
+    seed, land, elev, relief, sst, cities,
+    weather: genWeather(rand),
     wake: new Float32Array(n),
     cellDmg: new Float32Array(n),                    // 每格累積破壞 0~1
     regionSum: new Float32Array(REGIONS.length),     // 每個行政區的累積破壞
@@ -303,13 +293,87 @@ function cellIndex(x, y) {
   return clamp(Math.floor(y / CELL), 0, GH - 1) * GW + clamp(Math.floor(x / CELL), 0, GW - 1);
 }
 
-function envAt(x, y) {
-  const i = cellIndex(x, y);
+// t：第幾天；actual：true 為實際天氣，false 為預報
+function envAt(x, y, t, actual) {
+  const i = cellIndex(x, y), lon = xToLon(x), lat = yToLat(y);
   return {
-    land: !!world.land[i], elev: world.elev[i], shear: world.shear[i],
-    sst: world.sst[i] - world.wake[i], wake: world.wake[i], lon: xToLon(x), lat: yToLat(y),
+    land: !!world.land[i], elev: world.elev[i], shear: shearAt(lon, lat, t, actual),
+    sst: world.sst[i] + sstAnomaly(lon, lat, t, actual) - world.wake[i], wake: world.wake[i], lon, lat,
     region: regionMap.id[i],
   };
+}
+
+// ===== 動態天氣系統 =====
+// 每個系統都有「預報」參數與「實際」誤差；誤差隨時間放大，越遠的預報越不準
+function genWeather(rand) {
+  const R = (a, b) => a + rand() * (b - a);
+  const err = sd => (rand() + rand() + rand() - 1.5) * sd * 2;   // 近似常態分布
+  const systems = [];
+  const add = (kind, lon, lat, vlon, vlat, r, amp, t0, t1) => systems.push({
+    kind, lon, lat, vlon, vlat, r, amp, t0, t1,
+    err: { vlon: err(0.4), vlat: err(0.25), amp: err(0.3), t0: t0 > 0 ? err(1) : 0 },
+  });
+  // 強風切區（高空冷心低壓、槽線等）：熱帶向西移，中緯度隨西風向東移
+  for (let k = 0; k < 7; k++) {
+    const lat = R(12, 34);
+    const t0 = k < 4 ? R(-6, 0) : R(1, 8);     // 一部分開局就在，一部分之後才生成
+    add('shear', R(112, 150), lat, lat > 26 ? R(1, 3) : R(-2.5, -0.5), R(-0.6, 0.6),
+      R(2.5, 5), R(0.6, 1.1), t0, t0 + R(5, 11));
+  }
+  // 暖水／冷水渦旋：緩慢漂移的海溫異常
+  for (let k = 0; k < 8; k++) {
+    const sign = k % 2 ? -1 : 1;
+    add(sign > 0 ? 'warm' : 'cold', R(112, 150), R(10, 34), R(-0.6, 0.2), R(-0.3, 0.3),
+      R(2, 4), sign * R(0.8, 1.6), R(-8, 0), R(8, 20));
+  }
+  // 西風帶南緣隨時間南北擺動
+  const westerly = { base: 29, period: R(6, 10), phase: R(0, Math.PI * 2), err: { base: err(0.8), phase: err(0.5) } };
+  return { systems, westerly };
+}
+
+const forecastGrowth = t => clamp(t / 6, 0, 1);
+
+function sysState(s, t, actual) {
+  const e = actual ? s.err : null, g = forecastGrowth(t);
+  const t0 = s.t0 + (e ? e.t0 : 0);
+  const fade = clamp(Math.min(t - t0, s.t1 - t), 0, 1);   // 生成與消散各漸變 1 天
+  if (fade <= 0) return null;
+  const vlon = s.vlon + (e ? e.vlon : 0), vlat = s.vlat + (e ? e.vlat : 0);
+  return {
+    lon: s.lon + vlon * t, lat: s.lat + vlat * t, r: s.r, vlon, vlat,
+    amp: s.amp * (1 + (e ? e.amp * g : 0)) * fade,
+  };
+}
+
+function westerlyEdge(t, actual) {
+  const w = world.weather.westerly, g = actual ? forecastGrowth(t) : 0;
+  return w.base + w.err.base * g + 2.5 * Math.sin(2 * Math.PI * t / w.period + w.phase + w.err.phase * g);
+}
+
+// 某個時間點所有作用中的天氣系統（繪圖時對大量格點重複使用）
+function activeWeather(t, actual) {
+  const shear = [], eddies = [];
+  for (const sys of world.weather.systems) {
+    const st = sysState(sys, t, actual);
+    if (st) (sys.kind === 'shear' ? shear : eddies).push(st);
+  }
+  return { shear, eddies, edge: westerlyEdge(t, actual) };
+}
+
+const gauss = (s, lon, lat) => s.amp * Math.exp(-((lon - s.lon) ** 2 + (lat - s.lat) ** 2) / (s.r * s.r));
+
+function shearFrom(S, lon, lat) {
+  let v = clamp((lat - S.edge) / 8, 0, 1) * 0.45;
+  for (const s of S.shear) v += gauss(s, lon, lat);
+  return clamp(v, 0, 1);
+}
+
+function shearAt(lon, lat, t, actual) {
+  return shearFrom(activeWeather(t, actual), lon, lat);
+}
+
+function sstAnomaly(lon, lat, t, actual) {
+  return activeWeather(t, actual).eddies.reduce((a, e) => a + gauss(e, lon, lat), 0);
 }
 
 function regionName(k) {
@@ -396,7 +460,9 @@ function regionRanking() {
   return list.sort((a, b) => b.s - a.s);
 }
 
-// ===== 背景繪製 =====
+// ===== 畫面圖層 =====
+// earth：衛星真實色地表、lines：海岸線與經緯線（每局固定）
+// clouds / sst / shear：隨時間變動，依目前檢視的時間重繪
 function lerpStops(stops, v) {
   if (v <= stops[0][0]) return stops[0][1];
   for (let k = 1; k < stops.length; k++) {
@@ -409,103 +475,188 @@ function lerpStops(stops, v) {
   return stops[stops.length - 1][1];
 }
 
+const mix = (a, b, t) => a.map((v, j) => v + (b[j] - v) * t);
+const smoothstep = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+const makeCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+
 const SST_STOPS = [[22, [27, 58, 107]], [25, [31, 111, 159]], [26.5, [28, 154, 154]], [28.5, [217, 164, 65]], [31, [217, 84, 43]]];
-const LAND_STOPS = [[0, [91, 140, 74]], [0.45, [138, 122, 92]], [1, [176, 160, 132]]];
+const SHEAR_STOPS = [[0, [16, 34, 72]], [0.25, [62, 62, 150]], [0.5, [140, 70, 200]], [0.8, [225, 115, 235]], [1, [255, 200, 255]]];
+function makeLut(stops, v0, v1) {
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let k = 0; k < 256; k++) lut.set(lerpStops(stops, v0 + (v1 - v0) * k / 255), k * 3);
+  return lut;
+}
+const SST_LUT = makeLut(SST_STOPS, 20, 32), SHEAR_LUT = makeLut(SHEAR_STOPS, 0, 1);
+const lutIndex = (v, v0, v1) => clamp(Math.round((v - v0) / (v1 - v0) * 255), 0, 255) * 3;
 
-let bg;
-function renderBg() {
-  const small = document.createElement('canvas');
-  small.width = GW; small.height = GH;
-  const sctx = small.getContext('2d');
+// 雲層與風切圖用 1/4 解析度
+const QS = 4, QW = Math.ceil(W / QS), QH = Math.ceil(H / QS);
+const Q_LON = Float32Array.from({ length: QW }, (_, x) => xToLon((x + 0.5) * QS));
+const Q_LAT = Float32Array.from({ length: QH }, (_, y) => yToLat((y + 0.5) * QS));
+
+let earth, lines;
+function renderStatic() {
+  const { land, elev } = world;
+  const shore = coastDistance(land, true);
+  const small = makeCanvas(GW, GH), sctx = small.getContext('2d');
   const img = sctx.createImageData(GW, GH), d = img.data;
-  const { land, elev, sst } = world;
-  const isOcean = (x, y) => x >= 0 && y >= 0 && x < GW && y < GH && !land[y * GW + x];
-
+  const elevAt = (x, y) => world.relief[clamp(y, 0, GH - 1) * GW + clamp(x, 0, GW - 1)];
   for (let y = 0; y < GH; y++) {
+    const tropic = clamp((CELL_LAT[y] - 12) / 22, 0, 1);
+    const low = mix([46, 84, 38], [92, 100, 62], tropic);
     for (let x = 0; x < GW; x++) {
       const i = y * GW + x;
       let c;
       if (land[i]) {
-        c = lerpStops(LAND_STOPS, elev[i]);
+        const e = world.relief[i] * 0.7 + elev[i] * 0.3;
+        c = e < 0.5 ? mix(low, [92, 92, 62], e / 0.5) : mix([92, 92, 62], [128, 116, 92], (e - 0.5) / 0.5);
+        // 地形陰影（光從西北方來）與地表紋理
+        const shade = clamp(1 + (elevAt(x - 1, y) - elevAt(x + 1, y) + elevAt(x, y - 1) - elevAt(x, y + 1)) * 3, 0.75, 1.25);
+        const tex = 0.9 + 0.2 * fbm(cloudNoise, x * 0.15, y * 0.15, 3);
+        c = c.map(v => v * shade * tex);
       } else {
-        c = lerpStops(SST_STOPS, sst[i]);
-        const warm = sst[i] >= 26.5;
-        const nb = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
-        if (warm && nb.some(([nx, ny]) => isOcean(nx, ny) && sst[ny * GW + nx] < 26.5)) c = [235, 245, 255];
+        c = mix([9, 24, 54], [28, 76, 102], Math.exp(-shore[i] / 3) * 0.8);   // 近岸淺海較亮
       }
       d[i * 4] = c[0]; d[i * 4 + 1] = c[1]; d[i * 4 + 2] = c[2]; d[i * 4 + 3] = 255;
     }
   }
   sctx.putImageData(img, 0, 0);
+  earth = makeCanvas(W, H);
+  const ectx = earth.getContext('2d');
+  ectx.imageSmoothingEnabled = true;
+  ectx.drawImage(small, 0, 0, W, H);
 
-  bg = document.createElement('canvas');
-  bg.width = W; bg.height = H;
-  const bctx = bg.getContext('2d');
-  bctx.imageSmoothingEnabled = true;
-  bctx.drawImage(small, 0, 0, W, H);
+  // 仿氣象衛星雲圖：淡黃色海岸線、行政區界與經緯線疊在雲上
+  lines = makeCanvas(W, H);
+  const lctx = lines.getContext('2d');
+  lctx.strokeStyle = 'rgba(255,236,160,0.6)';
+  lctx.lineWidth = 0.9;
+  traceLand(lctx, 1);
+  lctx.stroke();
+  lctx.strokeStyle = 'rgba(255,236,160,0.16)';
+  lctx.lineWidth = 0.5;
+  lctx.beginPath();
+  for (const reg of REGIONS) traceRings(lctx, reg.r, 1);
+  lctx.stroke();
 
-  // 風切斜線
-  const full = bctx.getImageData(0, 0, W, H), fd = full.data;
-  for (let py = 0; py < H; py++) {
-    for (let px = 0; px < W; px++) {
-      if ((px + py) % 14 >= 3) continue;
-      const s = world.shear[Math.floor(py / CELL) * GW + Math.floor(px / CELL)];
-      if (s < 0.05) continue;
-      const a = s * 0.65, k = (py * W + px) * 4;
-      fd[k] = fd[k] * (1 - a) + 176 * a;
-      fd[k + 1] = fd[k + 1] * (1 - a) + 92 * a;
-      fd[k + 2] = fd[k + 2] * (1 - a) + 255 * a;
-    }
-  }
-  bctx.putImageData(full, 0, 0);
-
-  // 海岸線
-  bctx.strokeStyle = 'rgba(25,35,30,0.85)';
-  bctx.lineWidth = 1.2;
-  traceLand(bctx, 1);
-  bctx.stroke();
-
-  // 行政區界線
-  bctx.strokeStyle = 'rgba(30,30,30,0.3)';
-  bctx.lineWidth = 0.6;
-  bctx.beginPath();
-  for (const reg of REGIONS) traceRings(bctx, reg.r, 1);
-  bctx.stroke();
-
-  // 經緯網格（每 5 度）
-  bctx.strokeStyle = 'rgba(255,255,255,0.12)';
-  bctx.fillStyle = 'rgba(255,255,255,0.55)';
-  bctx.lineWidth = 1;
-  bctx.font = `11px ${FONT}`;
+  lctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  lctx.fillStyle = 'rgba(255,255,255,0.6)';
+  lctx.lineWidth = 1;
+  lctx.font = `11px ${FONT}`;
   for (let lon = 110; lon < LON1; lon += 5) {
     const x = Math.round(lonToX(lon)) + 0.5;
-    bctx.beginPath(); bctx.moveTo(x, 0); bctx.lineTo(x, H); bctx.stroke();
-    bctx.fillText(`${lon}°E`, x + 3, H - 5);
+    lctx.beginPath(); lctx.moveTo(x, 0); lctx.lineTo(x, H); lctx.stroke();
+    lctx.fillText(`${lon}°E`, x + 3, H - 5);
   }
   for (let lat = 10; lat < LAT1; lat += 5) {
     const y = Math.round(latToY(lat)) + 0.5;
-    bctx.beginPath(); bctx.moveTo(0, y); bctx.lineTo(W, y); bctx.stroke();
-    bctx.fillText(`${lat}°N`, 4, y - 4);
+    lctx.beginPath(); lctx.moveTo(0, y); lctx.lineTo(W, y); lctx.stroke();
+    lctx.fillText(`${lat}°N`, 4, y - 4);
   }
+  lctx.textAlign = 'center';
+  lctx.font = `bold 15px ${FONT}`;
+  lctx.fillStyle = 'rgba(255,255,255,0.35)';
+  for (const [name, lon, lat] of REGION_LABELS) lctx.fillText(name, lonToX(lon), latToY(lat));
 
-  // 地區名稱
-  bctx.textAlign = 'center';
-  bctx.font = `bold 15px ${FONT}`;
-  bctx.fillStyle = 'rgba(255,255,255,0.4)';
-  for (const [name, lon, lat] of REGION_LABELS) bctx.fillText(name, lonToX(lon), latToY(lat));
+  layerKey = '';
 }
 
-// 冷水尾跡圖層
-let wakeCanvas, wakeImg, wakeDirty = false;
+// --- 動態圖層 ---
+const sstLayer = makeCanvas(GW, GH), shearLayer = makeCanvas(QW, QH), cloudLayer = makeCanvas(QW, QH);
+const sstImg = sstLayer.getContext('2d').createImageData(GW, GH);
+const shearImg = shearLayer.getContext('2d').createImageData(QW, QH);
+const cloudImg = cloudLayer.getContext('2d').createImageData(QW, QH);
+const sstNow = new Float32Array(GW * GH);
+const cloudNoise = makeNoise(mulberry32(7)), streakNoise = makeNoise(mulberry32(11));
+let layerKey = '', layerAt = 0;
+
+function renderSstLayer(t, actual) {
+  const { land, sst, wake } = world, S = activeWeather(t, actual), d = sstImg.data;
+  for (let i = 0; i < sstNow.length; i++) sstNow[i] = sst[i] - wake[i];
+  for (const e of S.eddies) {
+    const reach = e.r * 2.5;
+    const x0 = Math.max(0, Math.floor(lonToX(e.lon - reach) / CELL)), x1 = Math.min(GW - 1, Math.ceil(lonToX(e.lon + reach) / CELL));
+    const y0 = Math.max(0, Math.floor(latToY(e.lat + reach) / CELL)), y1 = Math.min(GH - 1, Math.ceil(latToY(e.lat - reach) / CELL));
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++)
+        sstNow[y * GW + x] += e.amp * Math.exp(-((CELL_LON[x] - e.lon) ** 2 + (CELL_LAT[y] - e.lat) ** 2) / (e.r * e.r));
+  }
+  for (let y = 0; y < GH; y++) {
+    for (let x = 0; x < GW; x++) {
+      const i = y * GW + x;
+      if (land[i]) { d[i * 4 + 3] = 0; continue; }
+      const v = sstNow[i];
+      let k = lutIndex(v, 20, 32), r = SST_LUT[k], g = SST_LUT[k + 1], b = SST_LUT[k + 2];
+      // 26.5°C 等溫線
+      if (v >= 26.5 && ((x + 1 < GW && !land[i + 1] && sstNow[i + 1] < 26.5) || (x > 0 && !land[i - 1] && sstNow[i - 1] < 26.5)
+        || (y + 1 < GH && !land[i + GW] && sstNow[i + GW] < 26.5) || (y > 0 && !land[i - GW] && sstNow[i - GW] < 26.5))) {
+        r = 235; g = 245; b = 255;
+      }
+      d[i * 4] = r; d[i * 4 + 1] = g; d[i * 4 + 2] = b; d[i * 4 + 3] = 225;
+    }
+  }
+  sstLayer.getContext('2d').putImageData(sstImg, 0, 0);
+}
+
+function renderShearLayer(t, actual) {
+  const S = activeWeather(t, actual), d = shearImg.data;
+  for (let y = 0; y < QH; y++) {
+    for (let x = 0; x < QW; x++) {
+      const i = y * QW + x;
+      if (world.land[cellIndex((x + 0.5) * QS, (y + 0.5) * QS)]) { d[i * 4 + 3] = 0; continue; }
+      const k = lutIndex(shearFrom(S, Q_LON[x], Q_LAT[y]), 0, 1);
+      d[i * 4] = SHEAR_LUT[k]; d[i * 4 + 1] = SHEAR_LUT[k + 1]; d[i * 4 + 2] = SHEAR_LUT[k + 2]; d[i * 4 + 3] = 230;
+    }
+  }
+  shearLayer.getContext('2d').putImageData(shearImg, 0, 0);
+}
+
+// 雲量：暖海對流雲 + 西風帶鋒面雲帶 + 風切區被拉長的卷雲，並隨高空風飄移
+function renderCloudLayer(t, actual) {
+  const S = activeWeather(t, actual), d = cloudImg.data;
+  for (let y = 0; y < QH; y++) {
+    const lat = Q_LAT[y];
+    const u = -1.2 + 3.2 * smoothstep(S.edge - 4, S.edge + 2, lat);   // 信風帶向西、西風帶向東（度/天）
+    const front = 0.5 * Math.exp(-(((lat - S.edge - 2.5) / 2.2) ** 2));
+    for (let x = 0; x < QW; x++) {
+      const i = y * QW + x, lon = Q_LON[x], ax = lon - u * t;
+      const ci = cellIndex((x + 0.5) * QS, (y + 0.5) * QS);
+      const warm = world.land[ci] ? 0.1 : clamp((world.sst[ci] - 27.5) / 2.5, 0, 1) * (lat < 24 ? 0.4 : 0.2);
+      let cirrus = 0;
+      for (const s of S.shear) cirrus += s.amp * Math.exp(-((lon - s.lon) ** 2 + (lat - s.lat) ** 2) / (s.r * s.r));
+      const n = fbm(cloudNoise, ax * 0.38, lat * 0.38 + t * 0.15, 4);
+      let dens = n * (0.42 + warm + front) - 0.42;
+      if (cirrus > 0.05) {
+        const streak = fbm(streakNoise, ax * 0.3 + lat * 0.2, lat * 0.9, 4) - 0.42;   // 斜向拉長的卷雲
+        dens = Math.max(dens, streak * Math.min(cirrus, 1) * (0.6 + n) * 1.1);
+      }
+      const a = clamp(dens * 3.2, 0, 1);
+      const c = 200 + 55 * a;
+      d[i * 4] = c; d[i * 4 + 1] = c; d[i * 4 + 2] = c; d[i * 4 + 3] = a * 235;
+    }
+  }
+  cloudLayer.getContext('2d').putImageData(cloudImg, 0, 0);
+}
+
+function viewTime() {
+  return state === 'draw' ? { t: forecastDay, actual: false } : { t: ty ? ty.day : 0, actual: true };
+}
+
+// 只重繪目前檢視中的圖層；行進中每秒最多重繪約 8 次
+function refreshLayers(force) {
+  const { t, actual } = viewTime();
+  const key = `${view}|${actual}|${t.toFixed(2)}`;
+  const now = performance.now();
+  if (key === layerKey || (!force && state === 'run' && now - layerAt < 120)) return;
+  layerKey = key; layerAt = now;
+  if (view === 'sst') renderSstLayer(t, actual);
+  else if (view === 'shear') renderShearLayer(t, actual);
+  else renderCloudLayer(t, actual);
+}
+
 function resetWake() {
   world.wake.fill(0);
-  wakeCanvas = document.createElement('canvas');
-  wakeCanvas.width = GW; wakeCanvas.height = GH;
-  wakeImg = wakeCanvas.getContext('2d').createImageData(GW, GH);
-  for (let i = 0; i < GW * GH; i++) {
-    wakeImg.data[i * 4] = 190; wakeImg.data[i * 4 + 1] = 230; wakeImg.data[i * 4 + 2] = 255;
-  }
-  wakeDirty = true;
+  layerKey = '';
 }
 
 // 颱風攪動海水，把深層冷水帶上來：同一片海域待越久越冷
@@ -522,10 +673,39 @@ function coolOcean(x, y, I, dt) {
       const d2 = (dx * dx + dy * dy) / (r * r);
       if (d2 > 2.25) continue;
       world.wake[i] = Math.min(4, world.wake[i] + rate * dt * Math.exp(-d2 * 2));
-      wakeImg.data[i * 4 + 3] = world.wake[i] / 4 * 190;
     }
   }
-  wakeDirty = true;
+}
+
+// 颱風雲系：螺旋雲帶 + 中心密雲區 + 颱風眼，依強度重繪
+const vortexNoise = makeNoise(mulberry32(23));
+let tySprite = null, tySpriteI = -99;
+function typhoonSprite(I) {
+  if (tySprite && Math.abs(I - tySpriteI) < 1.5) return tySprite;
+  const Rc = 26 + I * 1.15, S = Math.ceil(Rc * 2.4), cx = S / 2;
+  const c = makeCanvas(S, S), g = c.getContext('2d'), img = g.createImageData(S, S), d = img.data;
+  const o = clamp((I - 15) / 40, 0, 1);              // 組織程度：越強越對稱、雲帶越清楚
+  const eye = I >= 33 ? 0.075 - 0.025 * o : 0;
+  for (let py = 0; py < S; py++) {
+    for (let px = 0; px < S; px++) {
+      const dx = (px + 0.5 - cx) / Rc, dy = (py + 0.5 - cx) / Rc, r = Math.hypot(dx, dy);
+      if (r > 1.2) continue;
+      const th = Math.atan2(dy, dx);
+      const arms = 0.5 + 0.5 * Math.cos(2 * (th - 2.3 * Math.log(r + 0.03)));
+      const n = fbm(vortexNoise, px * 0.07, py * 0.07, 4);
+      const core = 1 - smoothstep(0.1 + 0.15 * o, 0.38 + 0.15 * o, r);
+      const band = arms ** (1.2 + 2.5 * o) * (1 - smoothstep(0.25, 1.15, r));
+      const blob = (1 - o) * 0.55 * (1 - smoothstep(0.15, 0.9, r));
+      let dens = Math.max(core, band * (0.55 + 0.6 * o) + blob) * (0.5 + 0.8 * n);
+      if (eye) dens *= smoothstep(eye * 0.6, eye * 1.5, r);
+      const a = clamp(dens * 1.4 - 0.12, 0, 1);
+      const k = (py * S + px) * 4, v = 215 + 40 * a;
+      d[k] = v; d[k + 1] = v; d[k + 2] = v; d[k + 3] = a * 250;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  tySprite = c; tySpriteI = I;
+  return c;
 }
 
 // ===== 颱風強度分級（中央氣象署標準） =====
@@ -550,10 +730,13 @@ let trail = [];
 let hover = null;
 let speedMul = 1;
 let toastTimer = 0;
+let view = 'sat';          // sat：衛星雲圖 / sst：海溫 / shear：風切
+let forecastDay = 0;       // 畫路徑時預覽第幾天的預報
+let fcPlaying = false;
 
 function newGame(seed) {
   world = genWorld(seed);
-  renderBg();
+  renderStatic();
   resetRun(true);
   if (mode === 'mission') {
     const names = world.cities.filter(c => c.target).map(c => c.name).join('、');
@@ -576,8 +759,9 @@ function resetRun(clearPath) {
   resetWake();
   resetDamage();
   if (clearPath) { path = []; pathLen = 0; }
-  ty = null; trail = [];
+  ty = null; trail = []; tySprite = null;
   state = 'draw';
+  setForecastDay(0);
   $('result').classList.add('hidden');
   setStatus('準備', path.length ? '路徑已畫好，按「發動颱風」' : '從虛線框「颱風生成區」開始，按住拖曳畫出路徑');
   updateHud();
@@ -592,7 +776,7 @@ function toCanvas(e) {
 canvas.addEventListener('pointerdown', e => {
   if (state !== 'draw') return;
   const p = toCanvas(e);
-  const env = envAt(p.x, p.y);
+  const env = envAt(p.x, p.y, 0, false);
   if (env.land || !inGenesis(env.lon, env.lat)) {
     toast('颱風只能在「颱風生成區」的熱帶海面上生成！');
     return;
@@ -612,6 +796,7 @@ canvas.addEventListener('pointermove', e => {
     if (d >= 5 && pathLen + d <= MAX_PATH) {
       path.push({ x: clamp(p.x, 0, W), y: clamp(p.y, 0, H) });
       pathLen += d;
+      setForecastDay(pathLen / SPEED);   // 地圖顯示颱風抵達游標處那天的預報
     } else if (d >= 5) {
       toastOnce(`颱風壽命只有 ${MAX_DAYS} 天，路徑已達上限`);
     }
@@ -704,7 +889,7 @@ function step(dt) {
   const p = pointAt(ty.s);
   ty.x = p.x; ty.y = p.y;
 
-  const env = envAt(ty.x, ty.y);
+  const env = envAt(ty.x, ty.y, ty.day, true);
   const ch = intensityChange(env, ty.I);
   ty.I = clamp(ty.I + ch.dI * dt, 0, MAX_I);
   ty.factor = ch;
@@ -805,16 +990,57 @@ function finish(reason) {
 
 // ===== 繪圖 =====
 function draw() {
-  ctx.drawImage(bg, 0, 0);
-  if (wakeDirty) { wakeCanvas.getContext('2d').putImageData(wakeImg, 0, 0); wakeDirty = false; }
-  ctx.drawImage(wakeCanvas, 0, 0, W, H);
+  refreshLayers();
+  ctx.drawImage(earth, 0, 0);
+  if (view === 'sst') ctx.drawImage(sstLayer, 0, 0, W, H);
+  if (view === 'shear') ctx.drawImage(shearLayer, 0, 0, QW * QS, QH * QS);
   if (dmgDirty) { dmgCanvas.getContext('2d').putImageData(dmgImg, 0, 0); dmgDirty = false; }
   ctx.drawImage(dmgCanvas, 0, 0, W, H);
+  if (view === 'sat') ctx.drawImage(cloudLayer, 0, 0, QW * QS, QH * QS);
+  ctx.drawImage(lines, 0, 0);
+  if (view === 'shear') drawShearArrows();
   drawGenesis();
   drawPath();
   drawTrail();
   drawCities();
   if (ty) drawTyphoon();
+  drawClock();
+}
+
+// 地圖右上角：目前顯示的是預報還是實況、第幾天
+function drawClock() {
+  const { t, actual } = viewTime();
+  const name = { sat: '衛星雲圖', sst: '海面溫度', shear: '垂直風切' }[view];
+  const text = `${name}｜${actual ? '實況' : '預報'} 第 ${t.toFixed(1)} 天`;
+  ctx.save();
+  ctx.font = `bold 13px ${FONT}`;
+  const w = ctx.measureText(text).width + 20;
+  ctx.fillStyle = 'rgba(5,12,24,0.75)';
+  ctx.fillRect(W - w - 10, 10, w, 26);
+  ctx.fillStyle = actual ? '#fff' : '#ffd66b';
+  ctx.fillText(text, W - w, 28);
+  ctx.restore();
+}
+
+// 風切圖上標出各風切系統未來一天的移動方向
+function drawShearArrows() {
+  const { t, actual } = viewTime();
+  ctx.save();
+  ctx.strokeStyle = ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = 2;
+  for (const s of activeWeather(t, actual).shear) {
+    if (s.amp < 0.3) continue;
+    const x = lonToX(s.lon), y = latToY(s.lat);
+    const ex = lonToX(s.lon + s.vlon), ey = latToY(s.lat + s.vlat);
+    const ang = Math.atan2(ey - y, ex - x);
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ex + Math.cos(ang) * 6, ey + Math.sin(ang) * 6);
+    ctx.lineTo(ex + Math.cos(ang + 2.5) * 7, ey + Math.sin(ang + 2.5) * 7);
+    ctx.lineTo(ex + Math.cos(ang - 2.5) * 7, ey + Math.sin(ang - 2.5) * 7);
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 function drawGenesis() {
@@ -935,7 +1161,6 @@ function drawCities() {
 
 function drawTyphoon() {
   const { x, y, I, rot } = ty;
-  const R = 14 + I * 0.7;
   const cat = category(I);
   ctx.save();
   ctx.translate(x, y);
@@ -943,46 +1168,23 @@ function drawTyphoon() {
   // 暴風圈
   ctx.setLineDash([4, 6]);
   ctx.strokeStyle = cat.color;
-  ctx.globalAlpha = 0.7;
+  ctx.globalAlpha = 0.6;
   ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.arc(0, 0, damageRadius(I), 0, Math.PI * 2); ctx.stroke();
   ctx.setLineDash([]);
   ctx.globalAlpha = 1;
 
-  // 雲團
-  const g = ctx.createRadialGradient(0, 0, R * 0.15, 0, 0, R * 1.3);
-  g.addColorStop(0, 'rgba(255,255,255,0.85)');
-  g.addColorStop(0.6, 'rgba(235,240,248,0.45)');
-  g.addColorStop(1, 'rgba(235,240,248,0)');
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(0, 0, R * 1.3, 0, Math.PI * 2); ctx.fill();
-
-  // 螺旋雲帶（北半球逆時針旋轉）
+  // 雲系（北半球逆時針旋轉）
+  const sprite = typhoonSprite(I);
   ctx.rotate(-rot);
-  ctx.lineCap = 'round';
-  for (let k = 0; k < 4; k++) {
-    let px = null, py = null;
-    for (let t = 0; t <= 1.001; t += 0.05) {
-      const r = R * 0.22 + t * R * 1.1;
-      const a = k * Math.PI / 2 + t * 2.6;
-      const nx = Math.cos(a) * r, ny = Math.sin(a) * r;
-      if (px !== null) {
-        ctx.strokeStyle = `rgba(255,255,255,${0.9 - t * 0.7})`;
-        ctx.lineWidth = (1 - t) * R * 0.22 + 1;
-        ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(nx, ny); ctx.stroke();
-      }
-      px = nx; py = ny;
-    }
-  }
+  ctx.drawImage(sprite, -sprite.width / 2, -sprite.height / 2);
+  ctx.restore();
 
-  // 颱風眼
-  ctx.lineWidth = 3;
+  // 中心標記
+  ctx.save();
   ctx.strokeStyle = cat.color;
-  ctx.beginPath(); ctx.arc(0, 0, R * 0.22, 0, Math.PI * 2); ctx.stroke();
-  if (I >= 32.7) {
-    ctx.fillStyle = 'rgba(20,32,52,0.85)';
-    ctx.beginPath(); ctx.arc(0, 0, R * 0.1, 0, Math.PI * 2); ctx.fill();
-  }
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.stroke();
   ctx.restore();
 }
 
@@ -1013,8 +1215,8 @@ function updateHud() {
     $('envLabel').textContent = '颱風位置環境';
     env = ty.env; factor = ty.factor;
   } else if (hover) {
-    $('envLabel').textContent = '游標位置環境';
-    env = envAt(hover.x, hover.y);
+    $('envLabel').textContent = `游標位置（第 ${forecastDay.toFixed(1)} 天預報）`;
+    env = envAt(hover.x, hover.y, forecastDay, false);
     factor = intensityChange(env, 35);
   }
   if (env) {
@@ -1052,6 +1254,11 @@ function updateHud() {
   $('launchBtn').disabled = state !== 'draw' || path.length < 2 || drawing;
   $('clearBtn').disabled = state === 'run';
   $('newBtn').disabled = state === 'run';
+  $('fcDay').disabled = $('fcPlay').disabled = state !== 'draw';
+  if (state !== 'draw' && ty) {
+    $('fcDay').value = ty.day;
+    $('fcLabel').textContent = `實況 第 ${ty.day.toFixed(1)} 天`;
+  }
 }
 
 function rankItems(list) {
@@ -1059,6 +1266,23 @@ function rankItems(list) {
     const c = LEVELS[lv - 1].color;
     return `<li><span>${regionName(k)}</span><b style="background:rgb(${c})">${LEVELS[lv - 1].name} ${Math.round(s * 100)}%</b></li>`;
   }).join('');
+}
+
+function setView(v) {
+  view = v;
+  document.querySelectorAll('.views button').forEach(b => b.classList.toggle('on', b.dataset.view === v));
+  refreshLayers(true);
+}
+
+function setForecastDay(d) {
+  forecastDay = d;
+  $('fcDay').value = d;
+  $('fcLabel').textContent = `第 ${d.toFixed(1)} 天`;
+}
+
+function stopForecast() {
+  fcPlaying = false;
+  $('fcPlay').textContent = '▶';
 }
 
 function log(text, kind = '') {
@@ -1092,6 +1316,10 @@ function frame(now) {
   }
   for (const c of world.cities) c.hitT = Math.max(0, c.hitT - dt);
   if (toastTimer > 0 && (toastTimer -= dt) <= 0) $('toast').classList.add('hidden');
+  if (fcPlaying) {
+    if (state !== 'draw' || forecastDay >= MAX_DAYS) stopForecast();
+    else setForecastDay(Math.min(MAX_DAYS, forecastDay + dt * 2));
+  }
   draw();
   requestAnimationFrame(frame);
 }
@@ -1103,6 +1331,18 @@ $('retryBtn').onclick = () => { resetRun(false); log('↩️ 同任務再挑戰'
 $('nextBtn').onclick = () => newGame(Math.floor(Math.random() * 1e9));
 $('newBtn').onclick = () => { if (state !== 'run') newGame(Math.floor(Math.random() * 1e9)); };
 document.querySelectorAll('.mode button').forEach(b => { b.onclick = () => setMode(b.dataset.mode); });
+document.querySelectorAll('.views button').forEach(b => { b.onclick = () => setView(b.dataset.view); });
+$('fcDay').oninput = e => { stopForecast(); setForecastDay(+e.target.value); };
+$('fcPlay').onclick = () => {
+  if (fcPlaying) return stopForecast();
+  if (forecastDay >= MAX_DAYS) setForecastDay(0);
+  fcPlaying = true;
+  $('fcPlay').textContent = '⏸';
+};
+window.addEventListener('keydown', e => {
+  const v = { 1: 'sat', 2: 'sst', 3: 'shear' }[e.key];
+  if (v) setView(v);
+});
 $('speedBtn').onclick = () => {
   speedMul = speedMul === 1 ? 2 : speedMul === 2 ? 4 : 1;
   $('speedBtn').textContent = `速度 ×${speedMul}`;
