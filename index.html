@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>颱風來襲</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>🌀 颱風來襲</h1>
+    <p class="sub">從菲律賓東方的颱風生成區畫出路徑，經過溫暖海面讓颱風長大，再撲向東亞各地。陸地、高山、冷水、風切都會削弱颱風，在同一片海域繞圈也會把海水攪冷。</p>
+  </header>
+
+  <main>
+    <section class="stage">
+      <canvas id="map" width="960" height="706"></canvas>
+      <div id="toast" class="toast hidden"></div>
+      <div id="result" class="modal hidden">
+        <div class="card">
+          <h2 id="resultTitle">颱風結束</h2>
+          <div id="resultBody"></div>
+          <div class="row">
+            <button id="retryBtn">同一局再挑戰</button>
+            <button id="nextBtn" class="primary">下一局</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <div class="mode">
+        <button data-mode="mission" class="on">🎯 任務模式</button>
+        <button data-mode="free">🗺️ 自由模式</button>
+      </div>
+
+      <div class="block">
+        <div class="label" id="statusLabel">準備</div>
+        <div id="status" class="status">從颱風生成區開始，按住拖曳畫出路徑</div>
+      </div>
+
+      <div class="block" id="missionBlock">
+        <div class="label">任務目標</div>
+        <ul id="targets" class="targets"></ul>
+        <ul id="stars" class="star-list"></ul>
+      </div>
+
+      <div class="block">
+        <div class="wind">
+          <span id="windVal">--</span><small>m/s</small>
+          <span id="catBadge" class="badge">尚未生成</span>
+        </div>
+        <div class="meter">
+          <div id="windBar" class="fill"></div>
+          <i style="left:20.2%"></i><i style="left:38.5%"></i><i style="left:60%"></i>
+        </div>
+        <div class="meter-labels"><span>低壓</span><span>輕度</span><span>中度</span><span>強烈</span></div>
+      </div>
+
+      <div class="block">
+        <div class="label">颱風壽命 <b id="dayVal" class="right">0 / 12 天</b></div>
+        <div class="meter"><div id="dayBar" class="fill path"></div></div>
+      </div>
+
+      <div class="block">
+        <div class="label" id="envLabel">游標位置環境</div>
+        <div class="env">
+          <div><span>地區</span><b id="envPos">--</b></div>
+          <div><span>地形</span><b id="envTerrain">--</b></div>
+          <div><span>海溫</span><b id="envSst">--</b></div>
+          <div><span>風切</span><b id="envShear">--</b></div>
+        </div>
+        <div id="factor" class="factor">--</div>
+      </div>
+
+      <div class="block">
+        <div class="env">
+          <div><span>災損指數</span><b id="lossStat">0</b></div>
+          <div><span>城市摧毀</span><b id="cityStat">0 / 0</b></div>
+        </div>
+        <div class="label" style="margin-top:10px">災情排行</div>
+        <ol id="rank" class="rank"></ol>
+      </div>
+
+      <div class="buttons">
+        <button id="launchBtn" class="primary">🌀 發動颱風</button>
+        <button id="clearBtn">清除路線</button>
+        <button id="speedBtn">速度 ×1</button>
+        <button id="newBtn">下一局</button>
+      </div>
+
+      <div class="block legend">
+        <div class="label">圖例</div>
+        <div class="sst-scale"></div>
+        <div class="sst-ticks"><span>22°C 冷</span><span>26.5°C</span><span>31°C 暖</span></div>
+        <ul>
+          <li><span class="sw warm"></span>海溫越高 → 增強上限越高</li>
+          <li><span class="sw line"></span>26.5°C 等溫線（以下會減弱）</li>
+          <li><span class="sw shear"></span>紫色斜線：垂直風切（撕裂颱風）</li>
+          <li><span class="sw wake"></span>冷水尾跡：颱風攪冷的海水</li>
+          <li><span class="sw land"></span>陸地減弱，高山減弱更快</li>
+        </ul>
+        <div class="label" style="margin-top:10px">災情等級</div>
+        <div class="dmg-scale">
+          <span style="background:rgb(255,232,120)">輕微</span><span style="background:rgb(255,170,60)">中度</span><span style="background:rgb(240,90,50)">嚴重</span><span style="background:rgb(200,30,45);color:#fff">重大</span><span style="background:rgb(125,20,95);color:#fff">毀滅性</span>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="label">事件紀錄</div>
+        <ol id="log" class="log"></ol>
+      </div>
+
+      <p class="credit">地圖資料：Natural Earth（公有領域）</p>
+    </aside>
+  </main>
+
+  <script src="data/land.js"></script>
+  <script src="data/regions.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
