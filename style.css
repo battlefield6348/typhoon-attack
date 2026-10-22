@@ -30,7 +30,7 @@ main {
   max-width: 1320px;
 }
 
-.stage { position: relative; }
+.stage { position: relative; align-self: start; }
 
 #map {
   width: 100%;
@@ -186,6 +186,7 @@ button.primary:hover:not(:disabled) { background: #1b8ae0; }
 .rank li b { color: #1a1a1a; padding: 1px 7px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
 .rank li.empty { color: var(--muted); }
 
+.sw.prep { background: radial-gradient(circle, #fff 0 25%, transparent 27%), conic-gradient(#5ab0ff 0 65%, #0b1e3e 65%); border-radius: 50%; width: 14px; height: 14px; margin: 0 2px; }
 .sw.wake { background: #1c9a9a; }
 .sw.cloud { background: radial-gradient(circle at 30% 40%, #fff 0 30%, transparent 32%), radial-gradient(circle at 70% 60%, #eee 0 28%, #0b1e3e 30%); }
 .sw.cirrus { background: repeating-linear-gradient(170deg, rgba(255,255,255,.85) 0 2px, #0b1e3e 2px 5px); }
@@ -210,6 +211,30 @@ button.primary:hover:not(:disabled) { background: #1b8ae0; }
 .card .levels { margin-top: 10px; color: var(--muted); font-size: 13px; }
 .card .rank { margin-top: 8px; }
 .credit { margin: 0; color: var(--muted); font-size: 11px; }
+
+.name-row { display: flex; gap: 6px; }
+.name-row input {
+  flex: 1; min-width: 0; font: inherit; font-weight: 700; padding: 7px 10px;
+  border-radius: 8px; border: 1px solid var(--line); background: #0d1824; color: var(--text);
+}
+.name-row input:disabled { opacity: .6; }
+
+.ticker {
+  display: flex; align-items: stretch; height: 34px; margin-top: 8px;
+  border-radius: 8px; overflow: hidden; border: 1px solid #5a1a1a; background: #0a0f18;
+  font-weight: 700;
+}
+.tk-label {
+  flex: none; display: grid; place-items: center; padding: 0 14px;
+  background: #c8102e; color: #fff; letter-spacing: .1em;
+}
+.tk-label.flash { animation: flash .6s steps(2) infinite; }
+@keyframes flash { 50% { background: #ffd200; color: #c8102e; } }
+.tk-view { flex: 1; overflow: hidden; position: relative; }
+.tk-track { position: absolute; top: 0; bottom: 0; left: 0; display: flex; align-items: center; white-space: nowrap; will-change: transform; }
+.tk-track span { padding-right: 56px; color: #f2f5f9; }
+.tk-track span::before { content: '◆'; color: #c8102e; margin-right: 12px; }
+.tk-track span.urgent { color: #ffd200; }
 
 .hidden { display: none !important; }
 

@@ -18,8 +18,13 @@
         <button data-view="sat" class="on">🛰️ 衛星雲圖</button>
         <button data-view="sst">🌡️ 海溫</button>
         <button data-view="shear">💨 風切</button>
+        <button data-view="flow">🧭 駛流</button>
       </div>
       <canvas id="map" width="960" height="706"></canvas>
+      <div class="ticker">
+        <span id="tkLabel" class="tk-label">颱風快訊</span>
+        <div class="tk-view"><div id="tkTrack" class="tk-track"></div></div>
+      </div>
       <div id="toast" class="toast hidden"></div>
       <div id="result" class="modal hidden">
         <div class="card">
@@ -42,6 +47,14 @@
       <div class="block">
         <div class="label" id="statusLabel">準備</div>
         <div id="status" class="status">從颱風生成區開始，按住拖曳畫出路徑</div>
+      </div>
+
+      <div class="block">
+        <div class="label">颱風名稱</div>
+        <div class="name-row">
+          <input id="tyName" maxlength="8" placeholder="幫你的颱風取名字">
+          <button id="nameDice" title="隨機取名">🎲</button>
+        </div>
       </div>
 
       <div class="block" id="missionBlock">
@@ -73,6 +86,7 @@
           <button id="fcPlay" title="播放預報">▶</button>
           <input id="fcDay" type="range" min="0" max="12" step="0.1" value="0">
         </div>
+        <p class="hint">颱風被駛流推著走：路線顏色<b style="color:#8fe3ff">藍</b>＝順風很快、白＝正常、<b style="color:#ffd66b">黃</b>＝偏慢、<b style="color:#ff6b5e">紅</b>＝逆著駛流很慢（耗壽命又攪冷海水）。颱風接近時各地會防颱，拖越久損害越小。</p>
         <p class="hint">天氣系統會移動、生成與消散。畫路徑時地圖顯示颱風抵達該處那天的預報，但實際天氣會有誤差，越遠的日子越不準。</p>
       </div>
 
@@ -83,6 +97,8 @@
           <div><span>地形</span><b id="envTerrain">--</b></div>
           <div><span>海溫</span><b id="envSst">--</b></div>
           <div><span>風切</span><b id="envShear">--</b></div>
+          <div><span>駛流</span><b id="envSteer">--</b></div>
+          <div><span>防颱準備</span><b id="envPrep">--</b></div>
         </div>
         <div id="factor" class="factor">--</div>
       </div>
@@ -104,7 +120,7 @@
       </div>
 
       <div class="block legend">
-        <div class="label">圖例（按 1／2／3 切換圖層）</div>
+        <div class="label">圖例（按 1～4 切換圖層）</div>
         <div class="label">🛰️ 衛星雲圖</div>
         <ul>
           <li><span class="sw cloud"></span>團塊狀對流雲：暖海上的旺盛對流</li>
@@ -120,6 +136,10 @@
         <ul>
           <li><span class="sw land"></span>陸地減弱，高山減弱更快</li>
           <li><span class="sw wake"></span>颱風走過的海面會變冷（海溫圖可見）</li>
+        </ul>
+        <div class="label" style="margin-top:8px">🧭 駛流（箭頭＝颱風被推動的方向，藍色較快）</div>
+        <ul>
+          <li><span class="sw prep"></span>城市外圈藍弧：防颱準備進度（最多減少 40% 損害）</li>
         </ul>
         <div class="label" style="margin-top:10px">災情等級</div>
         <div class="dmg-scale">

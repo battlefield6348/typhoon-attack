@@ -18,9 +18,13 @@ const CELL_LON = Float32Array.from({ length: GW }, (_, x) => xToLon((x + 0.5) * 
 const CELL_LAT = Float32Array.from({ length: GH }, (_, y) => yToLat((y + 0.5) * CELL));
 
 // ===== 遊戲規則 =====
-const SPEED = 100;               // 颱風移動速度：100 px = 1 天（約時速 20 公里）
 const MAX_DAYS = 12;             // 颱風壽命上限
-const MAX_PATH = SPEED * MAX_DAYS;
+const PX_PER_DEG = W / (LON1 - LON0);
+// 颱風移動速度由駛流決定（px/天，1 px 約 5 公里）：順著駛流快，逆著走很慢
+const SELF_SPEED = 55, MIN_SPEED = 20, MAX_SPEED = 170;
+const WARN_R = 200;              // 颱風距離多近（px，約 1000 公里）各地開始防颱準備
+const PREP_RATE = 0.3;           // 防颱準備進度（每天）
+const PREP_CUT = 0.4;            // 準備完成時減少的損害比例
 const STAR_DAYS = 8;             // 三星條件：幾天內完成任務
 const START_I = 18;              // 生成時風速 (m/s)
 const DEAD_I = 10;               // 低於此風速即消散
@@ -34,7 +38,7 @@ const CITIES = [
   ['台北', 121.56, 25.04, 140], ['高雄', 120.30, 22.62, 120], ['馬尼拉', 120.98, 14.60, 130],
   ['宿霧', 123.90, 10.31, 100], ['香港', 114.17, 22.30, 150], ['廈門', 118.09, 24.48, 110],
   ['溫州', 120.70, 28.00, 100], ['上海', 121.47, 31.23, 150], ['那霸', 127.68, 26.21, 90],
-  ['鹿兒島', 130.56, 31.60, 100], ['大阪', 135.50, 34.69, 130], ['東京', 139.69, 35.69, 160],
+  ['鹿兒島', 130.56, 31.60, 100], ['大阪', 135.50, 34.69, 130], ['東京', 139.69, 35.69, 140],
   ['釜山', 129.08, 35.18, 120], ['首爾', 126.98, 37.57, 140], ['海口', 110.35, 20.02, 100],
   ['峴港', 108.22, 16.05, 100], ['關島', 144.79, 13.44, 80],
 ];
@@ -195,7 +199,9 @@ function rasterizeRegions(land) {
   }
   const cells = REGIONS.map(() => []);
   for (let i = 0; i < id.length; i++) if (id[i] >= 0) cells[id[i]].push(i);
-  regionMap = { id, cells };
+  const cx = cells.map(c => c.reduce((a, i) => a + (i % GW + 0.5) * CELL, 0) / (c.length || 1));
+  const cy = cells.map(c => c.reduce((a, i) => a + (Math.floor(i / GW) + 0.5) * CELL, 0) / (c.length || 1));
+  regionMap = { id, cells, cx, cy };
   return regionMap;
 }
 
@@ -272,6 +278,7 @@ function genWorld(seed) {
     cellDmg: new Float32Array(n),                    // 每格累積破壞 0~1
     regionSum: new Float32Array(REGIONS.length),     // 每個行政區的累積破壞
     regionLevel: new Int8Array(REGIONS.length),      // 每個行政區的災情等級 0~5
+    prep: new Float32Array(REGIONS.length),          // 每個行政區的防颱準備 0~1
   };
 }
 
@@ -328,7 +335,9 @@ function genWeather(rand) {
   }
   // 西風帶南緣隨時間南北擺動
   const westerly = { base: 29, period: R(6, 10), phase: R(0, Math.PI * 2), err: { base: err(0.8), phase: err(0.5) } };
-  return { systems, westerly };
+  // 太平洋高壓西緣隨時間東西伸縮，決定颱風在哪裡轉向北上
+  const high = { west: R(124, 134), period: R(5, 9), phase: R(0, Math.PI * 2), err: { west: err(2.5), phase: err(0.5) } };
+  return { systems, westerly, high };
 }
 
 const forecastGrowth = t => clamp(t / 6, 0, 1);
@@ -366,6 +375,31 @@ function shearFrom(S, lon, lat) {
   let v = clamp((lat - S.edge) / 8, 0, 1) * 0.45;
   for (const s of S.shear) v += gauss(s, lon, lat);
   return clamp(v, 0, 1);
+}
+
+function highWest(t, actual) {
+  const h = world.weather.high, g = actual ? forecastGrowth(t) : 0;
+  return h.west + h.err.west * g + 5 * Math.sin(2 * Math.PI * t / h.period + h.phase + h.err.phase * g);
+}
+
+// 駛流（度/天）：高壓南側吹東風把颱風往西推，西風帶往東，高壓西緣把颱風往北帶
+function steerAt(lon, lat, t, actual) {
+  const s = smoothstep(-3, 3, lat - (westerlyEdge(t, actual) - 4));
+  return {
+    u: -3.5 + 7.5 * s,
+    v: 1.2 + 2.4 * Math.exp(-(((lon - highWest(t, actual)) / 7) ** 2)) * (1 - 0.5 * s),
+  };
+}
+
+// 沿著方向 (dx, dy)（px 單位向量，y 向下）移動的速度
+function moveSpeed(steer, dx, dy) {
+  const along = (steer.u * dx - steer.v * dy) * PX_PER_DEG;
+  return clamp(SELF_SPEED + along * 0.9, MIN_SPEED, MAX_SPEED);
+}
+
+const DIRS = ['東', '東北', '北', '西北', '西', '西南', '南', '東南'];
+function dirName(u, v) {
+  return DIRS[(Math.round(Math.atan2(v, u) / (Math.PI / 4)) + 8) % 8];
 }
 
 function shearAt(lon, lat, t, actual) {
@@ -416,7 +450,7 @@ function damageLand(x, y, I, dt) {
       if (d >= R) continue;
       const wind = I * (1 - 0.6 * d / R);
       if (wind <= 20) continue;
-      const add = Math.min(1 - world.cellDmg[i], ((wind - 20) / 40) ** 1.5 * 1.2 * dt);
+      const add = Math.min(1 - world.cellDmg[i], ((wind - 20) / 40) ** 1.5 * 1.2 * dt * (1 - PREP_CUT * world.prep[k]));
       if (add <= 0) continue;
       world.cellDmg[i] += add;
       world.regionSum[k] += add;
@@ -429,6 +463,7 @@ function damageLand(x, y, I, dt) {
     world.regionLevel[k] = lv;
     paintRegion(k, lv);
     if (lv >= 4) log(`🏚️ ${regionName(k)} 災情「${LEVELS[lv - 1].name}」`, 'hit');
+    if (lv >= 3) news(`${regionName(k)} 災情${LEVELS[lv - 1].name}：${pick(DAMAGE_NEWS[lv - 1])}`, lv >= 4);
   }
 }
 
@@ -437,6 +472,7 @@ function resetDamage() {
   world.cellDmg.fill(0);
   world.regionSum.fill(0);
   world.regionLevel.fill(0);
+  world.prep.fill(0);
   dmgCanvas = document.createElement('canvas');
   dmgCanvas.width = GW; dmgCanvas.height = GH;
   dmgImg = dmgCanvas.getContext('2d').createImageData(GW, GH);
@@ -651,7 +687,7 @@ function refreshLayers(force) {
   layerKey = key; layerAt = now;
   if (view === 'sst') renderSstLayer(t, actual);
   else if (view === 'shear') renderShearLayer(t, actual);
-  else renderCloudLayer(t, actual);
+  else if (view === 'sat') renderCloudLayer(t, actual);
 }
 
 function resetWake() {
@@ -722,7 +758,7 @@ let mode = 'mission';      // mission：任務模式 / free：自由模式
 let world;
 let state = 'draw';        // draw | run | end
 let path = [];             // 使用者畫的路徑 [{x,y}]
-let pathLen = 0;
+let pathDays = [];         // 每個路徑點的預估抵達天數（依預報駛流）
 let drawing = false;
 let cum = [];              // 路徑累積長度
 let ty = null;             // 颱風
@@ -737,6 +773,8 @@ let fcPlaying = false;
 function newGame(seed) {
   world = genWorld(seed);
   renderStatic();
+  clearNews();
+  $('tyName').value = randomName();
   resetRun(true);
   if (mode === 'mission') {
     const names = world.cities.filter(c => c.target).map(c => c.name).join('、');
@@ -755,10 +793,10 @@ function setMode(m) {
 }
 
 function resetRun(clearPath) {
-  for (const c of world.cities) { c.hp = c.maxHp; c.hitT = 0; }
+  for (const c of world.cities) { c.hp = c.maxHp; c.hitT = 0; c.prep = 0; c.prepTold = false; }
   resetWake();
   resetDamage();
-  if (clearPath) { path = []; pathLen = 0; }
+  if (clearPath) { path = []; pathDays = []; }
   ty = null; trail = []; tySprite = null;
   state = 'draw';
   setForecastDay(0);
@@ -783,7 +821,7 @@ canvas.addEventListener('pointerdown', e => {
   }
   canvas.setPointerCapture(e.pointerId);
   drawing = true;
-  path = [p]; pathLen = 0;
+  path = [p]; pathDays = [0];
   updateHud();
 });
 
@@ -793,10 +831,12 @@ canvas.addEventListener('pointermove', e => {
   if (drawing) {
     const last = path[path.length - 1];
     const d = Math.hypot(p.x - last.x, p.y - last.y);
-    if (d >= 5 && pathLen + d <= MAX_PATH) {
-      path.push({ x: clamp(p.x, 0, W), y: clamp(p.y, 0, H) });
-      pathLen += d;
-      setForecastDay(pathLen / SPEED);   // 地圖顯示颱風抵達游標處那天的預報
+    const q = { x: clamp(p.x, 0, W), y: clamp(p.y, 0, H) };
+    const day = totalPathDays() + d / segmentSpeed(last, q, totalPathDays());
+    if (d >= 5 && day <= MAX_DAYS) {
+      path.push(q);
+      pathDays.push(day);
+      setForecastDay(day);   // 地圖顯示颱風抵達游標處那天的預報
     } else if (d >= 5) {
       toastOnce(`颱風壽命只有 ${MAX_DAYS} 天，路徑已達上限`);
     }
@@ -809,15 +849,35 @@ canvas.addEventListener('pointerleave', () => { hover = null; if (state === 'dra
 function endDraw() {
   if (!drawing) return;
   drawing = false;
-  if (path.length < 3) { path = []; pathLen = 0; }
+  if (path.length < 3) { path = []; pathDays = []; }
   else {
     path = chaikin(chaikin(path));
+    computePathDays();
     setStatus('準備', '路徑已畫好，按「發動颱風」');
   }
   updateHud();
 }
 canvas.addEventListener('pointerup', endDraw);
 canvas.addEventListener('pointercancel', endDraw);
+
+// 依預報駛流估算路段速度
+function segmentSpeed(a, b, t) {
+  const L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const steer = steerAt(xToLon((a.x + b.x) / 2), yToLat((a.y + b.y) / 2), t, false);
+  return moveSpeed(steer, (b.x - a.x) / L, (b.y - a.y) / L);
+}
+
+const totalPathDays = () => pathDays.length ? pathDays[pathDays.length - 1] : 0;
+
+function computePathDays() {
+  pathDays = [0];
+  for (let i = 1; i < path.length; i++) {
+    const d = Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+    pathDays.push(pathDays[i - 1] + d / segmentSpeed(path[i - 1], path[i], pathDays[i - 1]));
+  }
+  // 平滑後可能略超過壽命，截掉超出的部分
+  while (path.length > 2 && totalPathDays() > MAX_DAYS) { path.pop(); pathDays.pop(); }
+}
 
 // 平滑路徑，保留起終點
 function chaikin(pts) {
@@ -838,10 +898,14 @@ function launch() {
   for (let i = 1; i < path.length; i++)
     cum.push(cum[i - 1] + Math.hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y));
   ty = { s: 0, seg: 0, x: path[0].x, y: path[0].y, I: START_I, peak: START_I, rot: 0, day: 0,
-    cat: category(START_I).name, onLand: false, switchT: 0, factor: null, doneDay: null };
+    cat: category(START_I).name, onLand: false, switchT: 0, factor: null, doneDay: null,
+    name: typhoonName(), told: {}, warned: {}, speed: SELF_SPEED, steer: null };
+  $('tyName').value = ty.name;
   trail = [{ x: ty.x, y: ty.y, I: ty.I }];
   state = 'run';
-  log('🌀 颱風生成！', 'good');
+  log(`🌀 颱風「${ty.name}」生成！`, 'good');
+  const env0 = envAt(ty.x, ty.y, 0, true);
+  news(`中央氣象署：北緯 ${env0.lat.toFixed(1)} 度、東經 ${env0.lon.toFixed(1)} 度海面熱帶性低氣壓形成，命名為「${ty.name}」`, true);
   setStatus('颱風行進中', '觀察颱風強度的變化');
 }
 
@@ -867,7 +931,7 @@ function intensityChange(env, I) {
     f = { text: '🧊 冷水區：能量不足，減弱中', kind: 'bad' };
   } else {
     // 海溫決定可達到的最大強度
-    const potential = clamp((env.sst - 26) * 15, 0, MAX_I);
+    const potential = clamp((env.sst - 25) * 14, 0, MAX_I);
     dI = (I < potential ? 0.8 : 0.5) * (potential - I);
     f = I < potential - 1
       ? { text: '🔥 溫暖海面：吸收能量，增強中', kind: 'good' }
@@ -884,8 +948,12 @@ function intensityChange(env, I) {
 function damageRadius(I) { return 15 + I * 1.1; }
 
 function step(dt) {
-  ty.s = Math.min(ty.s + SPEED * dt, cum[cum.length - 1]);
-  ty.day = ty.s / SPEED;
+  // 依實際駛流沿路徑前進
+  const a = path[ty.seg], b = path[ty.seg + 1], L = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  ty.steer = steerAt(xToLon(ty.x), yToLat(ty.y), ty.day, true);
+  ty.speed = moveSpeed(ty.steer, (b.x - a.x) / L, (b.y - a.y) / L);
+  ty.s = Math.min(ty.s + ty.speed * dt, cum[cum.length - 1]);
+  ty.day += dt;
   const p = pointAt(ty.s);
   ty.x = p.x; ty.y = p.y;
 
@@ -897,21 +965,28 @@ function step(dt) {
   ty.peak = Math.max(ty.peak, ty.I);
   ty.rot += (0.6 + ty.I / 18) * dt;
   coolOcean(ty.x, ty.y, ty.I, dt);
+  prepareDefenses(dt);
   damageLand(ty.x, ty.y, ty.I, dt);
 
   // 持續一小段時間才算登陸 / 出海，避免沿海岸線時紀錄洗版
+  if (env.land !== ty.onLand && ty.switchT === 0) ty.switchRegion = env.region;   // 記下剛碰到陸地的縣市
   ty.switchT = env.land !== ty.onLand ? ty.switchT + dt : 0;
-  if (ty.switchT > 0.3) {
+  if (ty.switchT > 0.15) {
     ty.onLand = env.land;
     ty.switchT = 0;
-    log(env.land ? '⚠️ 颱風登陸' : '🌊 颱風出海', env.land ? 'bad' : 'good');
+    const where = ty.switchRegion >= 0 ? regionName(ty.switchRegion) : '';
+    log(env.land ? `⚠️ 「${ty.name}」登陸 ${where}` : `🌊 「${ty.name}」出海`, env.land ? 'bad' : 'good');
+    if (env.land) news(`${category(ty.I).name}「${ty.name}」第 ${ty.day.toFixed(1)} 天登陸${where ? ` ${where}` : ''}，各地嚴加戒備`, ty.I >= 32.7);
+    else news(`「${ty.name}」出海，可能重新吸收能量`);
   }
   const cat = category(ty.I).name;
   if (cat !== ty.cat) {
     const up = CATEGORY_ORDER.indexOf(cat) > CATEGORY_ORDER.indexOf(ty.cat);
-    log(`${up ? '⬆️ 增強為' : '⬇️ 減弱為'}${cat}（${ty.I.toFixed(0)} m/s）`, up ? 'good' : 'bad');
+    log(`${up ? '⬆️' : '⬇️'} 「${ty.name}」${up ? '增強' : '減弱'}為${cat}（${ty.I.toFixed(0)} m/s）`, up ? 'good' : 'bad');
+    news(`「${ty.name}」${up ? '增強' : '減弱'}為${cat}，近中心最大風速每秒 ${ty.I.toFixed(0)} 公尺`, up && cat === '強烈颱風');
     ty.cat = cat;
   }
+  reportEnvironment(env);
 
   const last = trail[trail.length - 1];
   if (Math.hypot(ty.x - last.x, ty.y - last.y) > 3) trail.push({ x: ty.x, y: ty.y, I: ty.I });
@@ -922,12 +997,13 @@ function step(dt) {
     if (c.hp <= 0) continue;
     const d = Math.hypot(c.x - ty.x, c.y - ty.y);
     if (d < R && ty.I > 17.2) {
-      const dmg = Math.min(c.hp, (ty.I - 15) * 6 * (1 - d / R) * dt);
+      const dmg = Math.min(c.hp, (ty.I - 15) * 9 * (1 - d / R) * dt * (1 - PREP_CUT * c.prep));
       c.hp -= dmg;
       c.hitT = 0.3;
       if (c.hp <= 0.01) {
         c.hp = 0;
         log(`💥 ${c.target ? '🎯 ' : ''}${c.name} 被摧毀！（第 ${ty.day.toFixed(1)} 天）`, 'hit');
+        news(`${c.name}遭「${ty.name}」重創，${pick(DAMAGE_NEWS[4])}`, true);
       }
     }
   }
@@ -936,8 +1012,46 @@ function step(dt) {
     ty.doneDay = ty.day;
     return finish('任務成功！');
   }
-  if (ty.I < DEAD_I) return finish('颱風已消散');
-  if (ty.s >= cum[cum.length - 1]) return finish('颱風走完預定路徑');
+  if (ty.I < DEAD_I) return finish('已消散');
+  if (ty.day >= MAX_DAYS) return finish('壽命結束');
+  if (ty.s >= cum[cum.length - 1]) return finish('走完預定路徑');
+}
+
+// 颱風接近時各國發布警報、展開防颱準備：拖越久，受到的損害越小
+function prepareDefenses(dt) {
+  for (let k = 0; k < REGIONS.length; k++) {
+    if (!regionMap.cells[k].length) continue;
+    if (Math.hypot(regionMap.cx[k] - ty.x, regionMap.cy[k] - ty.y) > WARN_R) continue;
+    world.prep[k] = Math.min(1, world.prep[k] + PREP_RATE * dt);
+    const country = REGIONS[k].c;
+    if (!ty.warned[country]) {
+      ty.warned[country] = true;
+      log(`📢 ${country}發布颱風警報`, 'bad');
+      news(`${country}發布颱風警報，各地展開防颱準備`, true);
+    }
+  }
+  for (const c of world.cities) {
+    if (c.hp <= 0 || Math.hypot(c.x - ty.x, c.y - ty.y) > WARN_R) continue;
+    c.prep = Math.min(1, c.prep + PREP_RATE * dt);
+    if (c.prep >= 1 && !c.prepTold) {
+      c.prepTold = true;
+      news(`${c.name}完成防颱準備，損害可望降低`);
+    }
+  }
+}
+
+function reportEnvironment(env) {
+  const cases = {
+    mountain: [env.land && env.elev > 0.5, `「${ty.name}」受高山地形破壞，結構明顯減弱`],
+    shear: [!env.land && env.shear > 0.5, `「${ty.name}」遭遇強烈垂直風切，雲系被撕裂`],
+    cold: [!env.land && env.sst < 26, `「${ty.name}」進入冷水區，強度逐漸減弱`],
+    wake: [!env.land && env.wake > 1, `「${ty.name}」在同一海域徘徊，攪冷海水難以增強`],
+    warm: [!env.land && env.sst > 30, `「${ty.name}」行經 30 度以上的溫暖海面，可能迅速增強`],
+  };
+  for (const [key, [on, text]] of Object.entries(cases)) {
+    if (on && !ty.told[key]) news(text);
+    ty.told[key] = on;
+  }
 }
 
 function starChecks() {
@@ -951,7 +1065,7 @@ function starChecks() {
 
 function finish(reason) {
   state = 'end';
-  log(`🏁 ${reason}`, ty.doneDay !== null ? 'good' : '');
+  log(`🏁 「${ty.name}」${reason}`, ty.doneDay !== null ? 'good' : '');
   const destroyed = world.cities.filter(c => c.hp <= 0);
   const targetsDown = destroyed.filter(c => c.target).length;
   const ranking = regionRanking();
@@ -970,7 +1084,9 @@ function finish(reason) {
     head = `<div class="grade">${grade}</div>`;
   }
   const counts = LEVELS.map((L, j) => `${L.name} ${ranking.filter(r => r.lv === j + 1).length}`).reverse().join('、');
-  $('resultTitle').textContent = reason;
+  $('resultTitle').textContent = `颱風「${ty.name}」${reason}`;
+  const worst = ranking[0];
+  news(`「${ty.name}」${reason}。共造成 ${ranking.length} 個行政區受災${worst ? `，以${regionName(worst.k)}災情最為${LEVELS[worst.lv - 1].name}` : ''}，最大風速每秒 ${ty.peak.toFixed(0)} 公尺`, true);
   $('resultBody').innerHTML = `${head}
     <div class="score">${score.toLocaleString()} 分</div>
     <table>
@@ -999,6 +1115,7 @@ function draw() {
   if (view === 'sat') ctx.drawImage(cloudLayer, 0, 0, QW * QS, QH * QS);
   ctx.drawImage(lines, 0, 0);
   if (view === 'shear') drawShearArrows();
+  if (view === 'flow') drawFlow();
   drawGenesis();
   drawPath();
   drawTrail();
@@ -1010,7 +1127,7 @@ function draw() {
 // 地圖右上角：目前顯示的是預報還是實況、第幾天
 function drawClock() {
   const { t, actual } = viewTime();
-  const name = { sat: '衛星雲圖', sst: '海面溫度', shear: '垂直風切' }[view];
+  const name = { sat: '衛星雲圖', sst: '海面溫度', shear: '垂直風切', flow: '駛流' }[view];
   const text = `${name}｜${actual ? '實況' : '預報'} 第 ${t.toFixed(1)} 天`;
   ctx.save();
   ctx.font = `bold 13px ${FONT}`;
@@ -1019,6 +1136,46 @@ function drawClock() {
   ctx.fillRect(W - w - 10, 10, w, 26);
   ctx.fillStyle = actual ? '#fff' : '#ffd66b';
   ctx.fillText(text, W - w, 28);
+  ctx.restore();
+}
+
+// 駛流圖：箭頭為颱風會被推動的方向與速度，並標出太平洋高壓與西風帶
+function drawFlow() {
+  const { t, actual } = viewTime();
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,12,24,0.35)';
+  ctx.fillRect(0, 0, W, H);
+  for (let y = 30; y < H; y += 48) {
+    for (let x = 30; x < W; x += 48) {
+      const st = steerAt(xToLon(x), yToLat(y), t, actual);
+      const mag = Math.hypot(st.u, st.v), len = 6 + mag * 4.5;
+      const ang = Math.atan2(-st.v, st.u), ex = x + Math.cos(ang) * len, ey = y + Math.sin(ang) * len;
+      ctx.strokeStyle = ctx.fillStyle = mag > 3.5 ? '#8fe3ff' : 'rgba(255,255,255,0.8)';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(x - Math.cos(ang) * len / 2, y - Math.sin(ang) * len / 2); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(ex + Math.cos(ang) * 4, ey + Math.sin(ang) * 4);
+      ctx.lineTo(ex + Math.cos(ang + 2.4) * 5, ey + Math.sin(ang + 2.4) * 5);
+      ctx.lineTo(ex + Math.cos(ang - 2.4) * 5, ey + Math.sin(ang - 2.4) * 5);
+      ctx.fill();
+    }
+  }
+  const edge = westerlyEdge(t, actual), ey = latToY(edge);
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = 'rgba(255,214,107,0.8)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, ey); ctx.lineTo(W, ey); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.font = `bold 13px ${FONT}`;
+  ctx.fillStyle = '#ffd66b';
+  ctx.fillText('西風帶南緣（以北往東吹）', 60, ey - 6);
+  const hx = lonToX(highWest(t, actual) + 12), hy = latToY(edge - 4);
+  ctx.textAlign = 'center';
+  ctx.font = `bold 34px ${FONT}`;
+  ctx.fillStyle = '#5ab0ff';
+  ctx.fillText('H', hx, hy + 12);
+  ctx.font = `bold 13px ${FONT}`;
+  ctx.fillText('太平洋高壓', hx, hy + 30);
   ctx.restore();
 }
 
@@ -1057,40 +1214,49 @@ function drawGenesis() {
   ctx.restore();
 }
 
+// 路段顏色：紅＝逆著駛流很慢、黃＝偏慢、白＝正常、藍＝順著駛流很快
+function speedColor(v) {
+  return v < 35 ? '#ff6b5e' : v < 70 ? '#ffd66b' : v > 120 ? '#8fe3ff' : '#ffffff';
+}
+
 function drawPath() {
   if (path.length < 2) {
     if (path.length === 1) dot(path[0].x, path[0].y, 5, '#fff');
     return;
   }
   ctx.save();
+  ctx.globalAlpha = state === 'draw' ? 0.95 : 0.45;
   ctx.lineCap = ctx.lineJoin = 'round';
   ctx.setLineDash([8, 7]);
-  ctx.lineWidth = 2.5;
-  ctx.strokeStyle = state === 'draw' ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.45)';
-  ctx.shadowColor = 'rgba(0,0,0,0.6)';
+  ctx.lineWidth = 3;
+  ctx.shadowColor = 'rgba(0,0,0,0.7)';
   ctx.shadowBlur = 4;
-  ctx.beginPath();
-  ctx.moveTo(path[0].x, path[0].y);
-  for (const p of path) ctx.lineTo(p.x, p.y);
-  ctx.stroke();
+  let acc = 0;
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1], b = path[i], len = Math.hypot(b.x - a.x, b.y - a.y);
+    const days = pathDays[i] - pathDays[i - 1];
+    ctx.strokeStyle = speedColor(days > 0 ? len / days : SELF_SPEED);
+    ctx.lineDashOffset = -acc;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    acc += len;
+  }
   ctx.setLineDash([]);
   ctx.shadowBlur = 0;
 
-  // 每天一個刻度
-  ctx.fillStyle = ctx.strokeStyle;
+  // 依預報駛流估算的每日位置
+  ctx.fillStyle = '#fff';
   ctx.font = `bold 11px ${FONT}`;
   ctx.textAlign = 'center';
-  let acc = 0, nextDay = 1;
+  let nextDay = 1;
   for (let i = 1; i < path.length; i++) {
-    const a = path[i - 1], b = path[i], seg = Math.hypot(b.x - a.x, b.y - a.y);
-    while (acc + seg >= nextDay * SPEED) {
-      const t = (nextDay * SPEED - acc) / seg;
+    while (pathDays[i] >= nextDay) {
+      const a = path[i - 1], b = path[i];
+      const t = (nextDay - pathDays[i - 1]) / ((pathDays[i] - pathDays[i - 1]) || 1);
       const x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
       ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
       if (nextDay % 2 === 0) ctx.fillText(`${nextDay}天`, x, y - 7);
       nextDay++;
     }
-    acc += seg;
   }
 
   // 終點箭頭
@@ -1142,6 +1308,10 @@ function drawCities() {
       ctx.strokeStyle = '#1b2a3a'; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.stroke();
     }
+    if (!dead && c.prep > 0.02) {   // 藍色圓弧：防颱準備進度
+      ctx.strokeStyle = '#5ab0ff'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(x, y, 8.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * c.prep); ctx.stroke();
+    }
     const ly = y < 24 ? y + 30 : y - 13;   // 太靠上緣時標籤放下方
     const label = c.target ? `🎯${c.name}` : c.name;
     ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.75)';
@@ -1185,12 +1355,111 @@ function drawTyphoon() {
   ctx.strokeStyle = cat.color;
   ctx.lineWidth = 2;
   ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.stroke();
+  // 颱風名稱
+  ctx.font = `bold 14px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillStyle = cat.color;
+  const label = `${ty.name} ${I.toFixed(0)} m/s`;
+  ctx.strokeText(label, x, y + damageRadius(I) + 16);
+  ctx.fillText(label, x, y + damageRadius(I) + 16);
   ctx.restore();
 }
 
 function dot(x, y, r, color) {
   ctx.fillStyle = color;
   ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+// ===== 颱風命名 =====
+// 西北太平洋颱風名單（中文譯名）
+const TYPHOON_NAMES = ['海葵', '山陀兒', '凱米', '康芮', '小犬', '天兔', '銀杏', '桑達', '丹娜絲', '百合',
+  '韋帕', '范斯高', '竹節草', '劍魚', '玲玲', '楊柳', '米克拉', '白鹿', '浣熊', '海神', '紅霞', '黑格比',
+  '薔琵', '杜鵑', '米雷', '尼莎', '奧鹿', '麥德姆', '巴威', '美莎克', '蘭恩', '蘇拉', '卡努', '圓規', '軒嵐諾'];
+
+function randomName() {
+  return TYPHOON_NAMES[Math.floor(Math.random() * TYPHOON_NAMES.length)];
+}
+
+function typhoonName() {
+  return $('tyName').value.trim() || randomName();
+}
+
+// ===== 新聞跑馬燈 =====
+const DAMAGE_NEWS = [
+  ['強風吹倒路樹、招牌掉落', '部分地區停電', '海邊湧浪，漁船回港避風'],
+  ['多處淹水，停電戶數持續攀升', '低窪地區積水，交通受阻', '農損初估上億元'],
+  ['土石流封路，數萬戶停電', '河川水位暴漲，緊急撤離居民', '宣布停班停課'],
+  ['災情慘重，大範圍停水停電', '橋梁沖毀，多處聚落成孤島', '國軍投入救災'],
+  ['城市機能癱瘓，損失難以估計', '史上罕見災情，國際救援馳援', '多項觀測紀錄遭打破'],
+];
+const IDLE_NEWS = [
+  '中央氣象署：西北太平洋海溫偏高，颱風生成條件良好',
+  '專家提醒：颱風行經溫暖海面恐迅速增強',
+  '颱風季來臨，民眾應做好防颱準備，檢查門窗與排水',
+  '黑潮帶來溫暖海水，北上颱風強度不易減弱',
+  '高山地形會破壞颱風結構，中央山脈常讓颱風「翻山」後減弱',
+];
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+const ticker = { queue: [], offset: 0, idle: 0 };
+
+function news(text, urgent = false) {
+  ticker.queue.push({ text, urgent });
+  // 積太多時先丟最舊的一般新聞，重大新聞保留
+  while (ticker.queue.length > 6) {
+    const k = ticker.queue.findIndex(n => !n.urgent);
+    ticker.queue.splice(k >= 0 ? k : 0, 1);
+  }
+  if (urgent) {
+    $('tkLabel').textContent = '插播';
+    $('tkLabel').classList.add('flash');
+    clearTimeout(ticker.flashTimer);
+    ticker.flashTimer = setTimeout(() => { $('tkLabel').textContent = '颱風快訊'; $('tkLabel').classList.remove('flash'); }, 6000);
+  }
+}
+
+function clearNews() {
+  ticker.queue = [];
+}
+
+// 沒有事件時播報：行進中報颱風動態，平時報預報與防颱資訊
+function idleNews() {
+  if (state === 'run' && ty) {
+    const env = ty.env;
+    const where = env && env.region >= 0 ? `位於${regionName(env.region)}一帶` : `位於北緯 ${env ? env.lat.toFixed(1) : '--'} 度、東經 ${env ? env.lon.toFixed(1) : '--'} 度`;
+    return `${category(ty.I).name}「${ty.name}」目前${where}，近中心最大風速每秒 ${ty.I.toFixed(0)} 公尺`;
+  }
+  ticker.idle++;
+  if (ticker.idle % 3 === 0 && world) {
+    let minDay = 0, minEdge = Infinity;
+    for (let d = 0; d <= MAX_DAYS; d += 0.5) {
+      const e = westerlyEdge(d, false);
+      if (e < minEdge) { minEdge = e; minDay = d; }
+    }
+    return `天氣預報：西風帶預計第 ${minDay.toFixed(1)} 天南移至北緯 ${minEdge.toFixed(0)} 度，北上颱風恐受強烈風切影響`;
+  }
+  return pick(IDLE_NEWS);
+}
+
+function tickTicker(dt) {
+  const track = $('tkTrack'), viewW = track.parentElement.clientWidth;
+  // 隊伍尾端進入畫面就補下一則
+  if (track.scrollWidth - ticker.offset < viewW + 40) {
+    const n = ticker.queue.shift() || { text: idleNews(), urgent: false };
+    const el = document.createElement('span');
+    el.textContent = n.text;
+    if (n.urgent) el.className = 'urgent';
+    track.appendChild(el);
+  }
+  ticker.offset += (95 + 30 * ticker.queue.length) * dt;   // 新聞積越多跑越快
+  const first = track.firstElementChild;
+  if (first && ticker.offset > first.offsetWidth) {
+    ticker.offset -= first.offsetWidth;
+    first.remove();
+  }
+  track.style.transform = `translateX(${-ticker.offset}px)`;
 }
 
 // ===== HUD =====
@@ -1225,22 +1494,29 @@ function updateHud() {
     $('envSst').textContent = env.land ? '--'
       : `${env.sst.toFixed(1)} °C${env.wake > 0.1 ? `（尾跡 −${env.wake.toFixed(1)}）` : ''}`;
     $('envShear').textContent = env.land ? '--' : env.shear > 0.5 ? '強' : env.shear > 0.1 ? '中' : '弱';
+    if (ty && ty.env === env) {
+      $('envSteer').textContent = `往${dirName(ty.steer.u, ty.steer.v)}推，時速 ${Math.round(ty.speed * 111 / PX_PER_DEG / 24)} 公里`;
+    } else {
+      const st = steerAt(env.lon, env.lat, forecastDay, false);
+      $('envSteer').textContent = `往${dirName(st.u, st.v)}，每天 ${Math.hypot(st.u, st.v).toFixed(1)} 度`;
+    }
+    $('envPrep').textContent = env.region >= 0 ? `${Math.round(world.prep[env.region] * 100)}%` : '--';
     $('factor').textContent = factor.text;
     $('factor').className = `factor ${factor.kind}`;
   } else {
-    ['envPos', 'envTerrain', 'envSst', 'envShear'].forEach(id => { $(id).textContent = '--'; });
+    ['envPos', 'envTerrain', 'envSst', 'envShear', 'envSteer', 'envPrep'].forEach(id => { $(id).textContent = '--'; });
     $('factor').textContent = '--';
     $('factor').className = 'factor';
   }
 
-  const days = ty ? ty.day : pathLen / SPEED;
+  const days = ty ? ty.day : totalPathDays();
   $('dayBar').style.width = `${days / MAX_DAYS * 100}%`;
   $('dayVal').textContent = `${days.toFixed(1)} / ${MAX_DAYS} 天`;
 
   $('targets').innerHTML = world.cities.filter(c => c.target).map(c => {
     const pct = Math.round(c.hp / c.maxHp * 100);
     return `<li class="${c.hp <= 0 ? 'done' : ''}"><span>🎯 ${c.name}</span>
-      <b>${c.hp <= 0 ? '✔ 已摧毀' : `耐久 ${Math.ceil(c.hp)}`}</b>
+      <b>${c.hp <= 0 ? '✔ 已摧毀' : `耐久 ${Math.ceil(c.hp)}${c.prep > 0.02 ? `｜防颱 ${Math.round(c.prep * 100)}%` : ''}`}</b>
       <div class="meter small"><div class="fill" style="width:${pct}%"></div></div></li>`;
   }).join('');
   $('stars').innerHTML = starChecks().map(c => `<li class="${c.ok ? 'ok' : ''}">${c.ok ? '★' : '☆'} ${c.text}</li>`).join('');
@@ -1254,6 +1530,7 @@ function updateHud() {
   $('launchBtn').disabled = state !== 'draw' || path.length < 2 || drawing;
   $('clearBtn').disabled = state === 'run';
   $('newBtn').disabled = state === 'run';
+  $('tyName').disabled = $('nameDice').disabled = state !== 'draw';
   $('fcDay').disabled = $('fcPlay').disabled = state !== 'draw';
   if (state !== 'draw' && ty) {
     $('fcDay').value = ty.day;
@@ -1321,11 +1598,13 @@ function frame(now) {
     else setForecastDay(Math.min(MAX_DAYS, forecastDay + dt * 2));
   }
   draw();
+  tickTicker(dt);
   requestAnimationFrame(frame);
 }
 
 // ===== 按鈕 =====
 $('launchBtn').onclick = launch;
+$('nameDice').onclick = () => { $('tyName').value = randomName(); };
 $('clearBtn').onclick = () => resetRun(true);
 $('retryBtn').onclick = () => { resetRun(false); log('↩️ 同任務再挑戰'); };
 $('nextBtn').onclick = () => newGame(Math.floor(Math.random() * 1e9));
@@ -1340,7 +1619,8 @@ $('fcPlay').onclick = () => {
   $('fcPlay').textContent = '⏸';
 };
 window.addEventListener('keydown', e => {
-  const v = { 1: 'sat', 2: 'sst', 3: 'shear' }[e.key];
+  if (e.target.tagName === 'INPUT') return;
+  const v = { 1: 'sat', 2: 'sst', 3: 'shear', 4: 'flow' }[e.key];
   if (v) setView(v);
 });
 $('speedBtn').onclick = () => {
